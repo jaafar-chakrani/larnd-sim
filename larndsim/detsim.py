@@ -122,95 +122,121 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states):
     itrk, ipix, it = cuda.grid(3)
     ntrk, npix, nt = cuda.gridsize(3)
 
-    if itrk < signals.shape[0] and ipix < signals.shape[1] and it < signals.shape[2]:
-        t = tracks[itrk]
-        pID = pixels[itrk][ipix]
-        if pID < 0 : return
-        pID_x, pID_y, pID_plane = id2pixel(pID)
+    if itrk >= signals.shape[0] or ipix >= signals.shape[1] or it >= signals.shape[2]:
+        return
 
-        if pID_x >= 0 and pID_y >= 0:
+    resp_nx = response.shape[0]
+    resp_ny = response.shape[1]
+    resp_bin = detector.RESPONSE_BIN_SIZE
+    resp_max_t = detector.RESPONSE_MAX_TIME
+    v_drift = detector.V_DRIFT
+    diff_n_sigmas = detector.DIFF_N_SIGMAS
+    min_step = detector.MIN_STEP_SIZE
+    pixel_pitch = detector.PIXEL_PITCH
 
-            # Pixel coordinates
-            x_p, y_p = get_pixel_coordinates(pID)
-            x_p += detector.PIXEL_PITCH / 2
-            y_p += detector.PIXEL_PITCH / 2
+    t = tracks[itrk]
+    pID = pixels[itrk][ipix]
+    if pID < 0 : return
 
-            if t["z_start"] < t["z_end"]:
-                start = (t["x_start"], t["y_start"], t["z_start"])
-                end = (t["x_end"], t["y_end"], t["z_end"])
-            else:
-                end = (t["x_start"], t["y_start"], t["z_start"])
-                start = (t["x_end"], t["y_end"], t["z_end"])
+    # unpack track fields into locals (fewer structured lookups)
+    z_start = t["z_start"]
+    z_end   = t["z_end"]
+    x_start = t["x_start"]
+    x_end   = t["x_end"]
+    y_start = t["y_start"]
+    y_end   = t["y_end"]
+    tran_diff = t["tran_diff"]
+    long_diff = t["long_diff"]
+    n_electrons = t["n_electrons"]
+    pixel_plane = t["pixel_plane"]
 
-            # if the time tick is before the segment start time, pass
-            this_time = it * detector.TIME_SAMPLING
+    pID_x, pID_y, pID_plane = id2pixel(pID)
 
-            # detector.TPC_BORDERS[t["pixel_plane"]][2][1]) is the corresponding cathode
-            dist_cathode = min(abs(t["z_end"] - detector.TPC_BORDERS[t["pixel_plane"]][2][1]), abs(t["z_start"] - detector.TPC_BORDERS[t["pixel_plane"]][2][1])) # closest distance to the cathode
-            # The valid time for integrating the charge signal is the response with the shifted collection position
-            # In order to conservatively include more time ticks
-            # we use the longest response time, and shortest distance to the cathode from the segments
-            # the distance is converted to time using nominal drift velocity
-            # pad with 5 times of longitudinal diffusion
-            if this_time > (detector.RESPONSE_MAX_TIME - dist_cathode / detector.V_DRIFT) + t['long_diff'] / detector.V_DRIFT * detector.DIFF_N_SIGMAS:
-                return
+    if pID_x < 0 or pID_y < 0:
+        return
 
-            segment = (end[0]-start[0], end[1]-start[1], end[2]-start[2])
-            length = sqrt(segment[0]**2 + segment[1]**2 + segment[2]**2)
+    # Pixel coordinates
+    x_p, y_p = get_pixel_coordinates(pID)
+    x_p += pixel_pitch / 2
+    y_p += pixel_pitch / 2
 
-            direction = (segment[0]/length, segment[1]/length, segment[2]/length)
-            sigmas = (t["tran_diff"], t["tran_diff"], t["long_diff"])
+    if z_start < z_end:
+        start = (x_start, y_start, z_start)
+        end = (x_end, y_end, z_end)
+    else:
+        end = (x_start, y_start, z_start)
+        start = (x_end, y_end, z_end)
 
-            # full response range and 5 sigmas of transverse diffusion
-            impact_factor = sqrt(response.shape[0]**2 +
-                                     response.shape[1]**2) * detector.RESPONSE_BIN_SIZE + t['tran_diff'] * detector.DIFF_N_SIGMAS
+    # if the time tick is before the segment start time, pass
+    this_time = it * detector.TIME_SAMPLING
 
-            subsegment_start, subsegment_end, skip = overlapping_segment(x_p, y_p, start, end, impact_factor)
-            if skip:
-                return
-            subsegment = (subsegment_end[0]-subsegment_start[0],
-                          subsegment_end[1]-subsegment_start[1],
-                          subsegment_end[2]-subsegment_start[2])
-            subsegment_length = sqrt(subsegment[0]**2 + subsegment[1]**2 + subsegment[2]**2)
-            if subsegment_length == 0:
-                return
+    # detector.TPC_BORDERS[t["pixel_plane"]][2][1]) is the corresponding cathode
+    cathode_z = detector.TPC_BORDERS[pixel_plane][2][1]
+    dist_cathode = min(abs(z_end - cathode_z), abs(z_start - cathode_z)) # closest distance to the cathode
+    # The valid time for integrating the charge signal is the response with the shifted collection position
+    # In order to conservatively include more time ticks
+    # we use the longest response time, and shortest distance to the cathode from the segments
+    # the distance is converted to time using nominal drift velocity
+    # pad with 5 times of longitudinal diffusion
+    if this_time > (resp_max_t - dist_cathode / v_drift) + long_diff / v_drift * diff_n_sigmas:
+        return
 
-            nstep = max(round(subsegment_length / detector.MIN_STEP_SIZE), 1)
-            step = subsegment_length / nstep # refine step size
+    segment = (end[0]-start[0], end[1]-start[1], end[2]-start[2])
+    length = sqrt(segment[0]**2 + segment[1]**2 + segment[2]**2)
 
-            charge = t["n_electrons"] * (subsegment_length/length) / nstep
-            total_current = 0
-            for istep in range(nstep):
-                x = subsegment_start[0] + step * (istep + 0.5) * direction[0]
-                y = subsegment_start[1] + step * (istep + 0.5) * direction[1]
-                z = subsegment_start[2] + step * (istep + 0.5) * direction[2]
+    direction = (segment[0]/length, segment[1]/length, segment[2]/length)
+    sigmas = (tran_diff, tran_diff, long_diff)
 
-                z += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[2]
+    # full response range and 5 sigmas of transverse diffusion
+    impact_factor = sqrt(resp_nx**2 +
+                                resp_ny**2) * resp_bin + tran_diff * diff_n_sigmas
 
-                # find how much to shift the time for anode (collection time)
-                # detector.TPC_BORDERS[t["pixel_plane"]][2][0] is anode
-                # detector.TPC_BORDERS[t["pixel_plane"]][2][1] is cathode
-                # equivalent to detector.DRIFT_LENGTH - abs(z - detector.TPC_BORDERS[t["pixel_plane"]][2][1])
-                shift_t_collect = abs(z - detector.TPC_BORDERS[t["pixel_plane"]][2][1]) / detector.V_DRIFT
+    subsegment_start, subsegment_end, skip = overlapping_segment(x_p, y_p, start, end, impact_factor)
+    if skip:
+        return
+    subsegment = (subsegment_end[0]-subsegment_start[0],
+                    subsegment_end[1]-subsegment_start[1],
+                    subsegment_end[2]-subsegment_start[2])
+    subsegment_length = sqrt(subsegment[0]**2 + subsegment[1]**2 + subsegment[2]**2)
+    if subsegment_length == 0:
+        return
 
-                x += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[0]
-                y += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[1]
-                x_dist = abs(x_p - x)
-                y_dist = abs(y_p - y)
+    nstep = max(round(subsegment_length / min_step), 1)
+    step = subsegment_length / nstep # refine step size
 
-                if x_dist > detector.RESPONSE_BIN_SIZE * response.shape[0]:
-                    continue
-                if y_dist > detector.RESPONSE_BIN_SIZE * response.shape[1]:
-                    continue
-                if (this_time + shift_t_collect) < 0 or (this_time + shift_t_collect) > detector.RESPONSE_MAX_TIME:
-                    continue
+    charge = n_electrons * (subsegment_length/length) / nstep
+    total_current = 0
+    for istep in range(nstep):
+        x = subsegment_start[0] + step * (istep + 0.5) * direction[0]
+        y = subsegment_start[1] + step * (istep + 0.5) * direction[1]
+        z = subsegment_start[2] + step * (istep + 0.5) * direction[2]
 
-                # this_time is the drift/readout time
-                # t0 is considered in a later stage
-                # (shift_t_collect) shifts the readout to the corresponding position 
-                total_current += charge * get_closest_waveform(x_dist, y_dist, this_time + shift_t_collect, response)
+        z += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[2]
 
-            signals[itrk,ipix,it] = total_current
+        # find how much to shift the time for anode (collection time)
+        # detector.TPC_BORDERS[t["pixel_plane"]][2][0] is anode
+        # detector.TPC_BORDERS[t["pixel_plane"]][2][1] is cathode
+        # equivalent to detector.DRIFT_LENGTH - abs(z - detector.TPC_BORDERS[t["pixel_plane"]][2][1])
+        shift_t_collect = abs(z - cathode_z) / v_drift
+
+        x += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[0]
+        y += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[1]
+        x_dist = abs(x_p - x)
+        y_dist = abs(y_p - y)
+
+        if x_dist > resp_bin * resp_nx:
+            continue
+        if y_dist > resp_bin * resp_ny:
+            continue
+        if (this_time + shift_t_collect) < 0 or (this_time + shift_t_collect) > resp_max_t:
+            continue
+
+        # this_time is the drift/readout time
+        # t0 is considered in a later stage
+        # (shift_t_collect) shifts the readout to the corresponding position 
+        total_current += charge * get_closest_waveform(x_dist, y_dist, this_time + shift_t_collect, response)
+
+    signals[itrk,ipix,it] = total_current
 
 @cuda.jit
 def sum_pixel_signals(pixels_signals, signals, track_t0, pixel_index_map, track_pixel_map, pixels_tracks_signals,
